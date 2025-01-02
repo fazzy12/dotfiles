@@ -1,103 +1,86 @@
 #!/bin/bash
 
-# Variables
-DOTFILE="$HOME/.installed_packages"
-REPO_DIR="$HOME/monitored_installs"
-GITHUB_REMOTE="https://github.com/fazzy12/dotfiles.git"
-BRANCH="main"
+# Ensure the script is run as root
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root"
+    exit 1
+fi
 
-# Function to initialize the Git repository if not already done
-initialize_repo() {
-    if [[ ! -d $REPO_DIR ]]; then
-        echo "Initializing Git repository..."
-        mkdir -p "$REPO_DIR"
-        cd "$REPO_DIR" || exit
-        git init
-        touch "$DOTFILE"
-        git add "$DOTFILE"
-        git commit -m "Initial commit: Added .installed_packages"
-        git branch -M "$BRANCH"
-        git remote add origin "$GITHUB_REMOTE"
-        git push -u origin "$BRANCH"
-    fi
-}
+PACKAGE_FILE=".installed_packages"
 
-# Function to log new installations manually
-log_manual_installation() {
-    echo "Please enter the name of the package, app, or file you installed:"
-    read -r package_name
-    if ! grep -Fxq "$package_name" "$DOTFILE"; then
-        echo "$package_name" >> "$DOTFILE"
-        sort -u -o "$DOTFILE" "$DOTFILE"
-        echo "Logged: $package_name"
-        push_to_github
-    else
-        echo "Package already logged."
-    fi
-}
+if [[ ! -f "$PACKAGE_FILE" ]]; then
+    echo "Package list file ($PACKAGE_FILE) not found."
+    exit 1
+fi
 
-# Function to monitor and log package installations
-monitor_installations() {
-    echo "Monitoring package installations..."
+echo "Starting package installation from $PACKAGE_FILE..."
 
-    while true; do
-        # Detect new APT packages
-        INSTALLED=$(comm -13 <(sort "$DOTFILE" 2>/dev/null || echo "") <(dpkg --get-selections | awk '{print $1}' | sort))
-        if [[ -n "$INSTALLED" ]]; then
-            echo "New APT packages detected: $INSTALLED"
-            echo "$INSTALLED" >> "$DOTFILE"
-            sort -u -o "$DOTFILE" "$DOTFILE"
-            push_to_github
-        fi
+# Update and upgrade the system
+echo "Updating and upgrading the system..."
+command -v apt >/dev/null 2>&1 || { echo "Error: 'apt' command not found. Exiting."; exit 1; }
+apt update && apt upgrade -y
 
-        # Detect new files in /usr/local/bin (example directory for manual installs)
-        NEW_FILES=$(find /usr/local/bin -type f -newer "$DOTFILE")
-        if [[ -n "$NEW_FILES" ]]; then
-            echo "New manually installed binaries detected:"
-            echo "$NEW_FILES"
-            echo "$NEW_FILES" >> "$DOTFILE"
-            sort -u -o "$DOTFILE" "$DOTFILE"
-            push_to_github
-        fi
+# Prepare logs
+LOG_DIR="./logs"
+mkdir -p "$LOG_DIR"
+SUCCESS_LOG="$LOG_DIR/success.log"
+FAILURE_LOG="$LOG_DIR/failure.log"
+> "$SUCCESS_LOG"
+> "$FAILURE_LOG"
 
-        sleep 10
-    done
-}
+# Process the package file
+while IFS= read -r line; do
+    # Skip empty lines or comments
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
 
-# Function to push updates to GitHub
-push_to_github() {
-    echo "Pushing changes to GitHub..."
-    cd "$REPO_DIR" || exit
-    cp "$DOTFILE" "$REPO_DIR"
-    git add "$DOTFILE"
-    git commit -m "Update: Added new installed packages or files"
-    git push
-}
+    # Parse the package type and name
+    PACKAGE_TYPE=$(echo "$line" | awk '{print $1}')
+    PACKAGE_NAME=$(echo "$line" | awk '{print $2}')
 
-# Main Menu
-initialize_repo
-echo "Script initialized."
-echo "Choose an option:"
-echo "1) Monitor installations automatically"
-echo "2) Log installation manually"
-echo "3) Exit"
-
-while true; do
-    read -rp "Enter your choice (1/2/3): " choice
-    case $choice in
-        1)
-            monitor_installations
+    case "$PACKAGE_TYPE" in
+        apt)
+            echo "Installing APT package: $PACKAGE_NAME"
+            if apt install -y "$PACKAGE_NAME"; then
+                echo "$PACKAGE_TYPE $PACKAGE_NAME" >> "$SUCCESS_LOG"
+            else
+                echo "$PACKAGE_TYPE $PACKAGE_NAME" >> "$FAILURE_LOG"
+            fi
             ;;
-        2)
-            log_manual_installation
+        snap)
+            echo "Installing Snap package: $PACKAGE_NAME"
+            command -v snap >/dev/null 2>&1 || { echo "Error: 'snap' command not found. Skipping."; exit 1; }
+            if snap install "$PACKAGE_NAME"; then
+                echo "$PACKAGE_TYPE $PACKAGE_NAME" >> "$SUCCESS_LOG"
+            else
+                echo "$PACKAGE_TYPE $PACKAGE_NAME" >> "$FAILURE_LOG"
+            fi
             ;;
-        3)
-            echo "Exiting..."
-            exit 0
+        custom)
+            echo "Installing custom package: $PACKAGE_NAME"
+            case "$PACKAGE_NAME" in
+                docker)
+                    echo "Installing Docker..."
+                    apt install -y docker-ce docker-ce-cli containerd.io
+                    ;;
+                mongodb)
+                    echo "Installing MongoDB Compass..."
+                    wget -qO - https://www.mongodb.org/static/pgp/server-6.0.asc | apt-key add -
+                    echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/6.0 multiverse" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+                    apt update && apt install -y mongodb-compass
+                    ;;
+                *)
+                    echo "Unknown custom package: $PACKAGE_NAME" >> "$FAILURE_LOG"
+                    ;;
+            esac
             ;;
         *)
-            echo "Invalid choice. Please enter 1, 2, or 3."
+            echo "Unknown package type: $PACKAGE_TYPE" >> "$FAILURE_LOG"
             ;;
     esac
-done
+done < "$PACKAGE_FILE"
+
+echo "All packages processed. Logs available in $LOG_DIR."
+echo "Success log: $SUCCESS_LOG"
+echo "Failure log: $FAILURE_LOG"
+
 
